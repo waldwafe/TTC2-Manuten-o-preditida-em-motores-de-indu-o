@@ -1,0 +1,294 @@
+//dados de parametros encontrados ao final do codigo podem ser alterados de acordo com o motor monitorado
+
+
+
+
+
+// Inclusão das bibliotecas necessárias
+#include "max6675.h"          // Biblioteca para o sensor de temperatura MAX6675 (termopares)
+#include <Wire.h>             // Biblioteca para comunicação I2C
+#include "EmonLib.h"          // Biblioteca para monitoramento de corrente (Energy Monitor)
+#include <LiquidCrystal_I2C.h> // Biblioteca para controlar display LCD via I2C
+#include <MPU6050.h>          // Biblioteca para o sensor de aceleração e giroscópio MPU6050
+
+// Definições para o MPU6050
+#define MPU_ADDR 0x68            // Endereço I2C do MPU6050
+#define SAMPLES 256              // Número de amostras para cálculo da DFT (Transformada Discreta de Fourier)
+#define SAMPLING_FREQUENCY 20000 // Frequência de amostragem
+#define PI 3.14159265358979323846 // Constante pi
+#define MOVING_AVERAGE_WINDOW 10  // Tamanho da janela para média móvel
+
+// Declaração do objeto MPU6050
+MPU6050 mpu;
+
+// Declaração das variáveis globais para aceleração e DFT
+float vReal[SAMPLES];           // Array para armazenar os dados de aceleração
+float amplitudes[SAMPLES / 2];  // Array para armazenar as amplitudes da DFT
+int16_t ax, ay, az;            // Variáveis para armazenar os valores de aceleração
+float buffer[MOVING_AVERAGE_WINDOW]; // Buffer para a média móvel
+int bufferIndex = 0;           // Índice para o buffer de média móvel
+
+// Declaração dos objetos para monitoramento de corrente
+EnergyMonitor sensor1, sensor2, sensor3;
+
+// Declaração de variáveis de controle de tela e botão
+const int botaoPin = 35;        // Pino do botão para alternar as telas
+int telaAtual = 0;              // Variável para controlar a tela exibida no LCD
+int ultimoEstadoBotao = HIGH;   // Variável para armazenar o último estado do botão
+unsigned long ultimaTroca = 0;  // Armazena o último tempo de troca de tela
+const unsigned long debounceDelay = 200; // Delay de debounce para o botão (200ms)
+
+// Definição dos pinos dos sensores de corrente
+int pinSensor1 = 32;
+int pinSensor2 = 33;
+int pinSensor3 = 26;
+
+// Multiplicadores para calibração dos sensores de corrente
+float multiplicador1 = 790.0904;
+float multiplicador2 = 756.0904;
+float multiplicador3 = 160.0904;
+
+// Definições dos pinos para os sensores de temperatura (MAX6675)
+int thermoDO = 19, thermoCS = 23, thermoCLK = 5;
+int thermoDO2 = 18, thermoCS2 = 17, thermoCLK2 = 4;
+int thermoDO3 = 15, thermoCS3 = 16, thermoCLK3 = 2;
+int thermoDO4 = 25, thermoCS4 = 14, thermoCLK4 = 27;
+
+// Definição dos objetos para os termopares MAX6675
+MAX6675 thermocouple(thermoCLK, thermoCS, thermoDO);
+MAX6675 thermocouple2(thermoCLK2, thermoCS2, thermoDO2);
+MAX6675 thermocouple3(thermoCLK3, thermoCS3, thermoDO3);
+MAX6675 thermocouple4(thermoCLK4, thermoCS4, thermoDO4);
+
+// Definição do objeto LCD para o display I2C
+LiquidCrystal_I2C lcd(0x27, 16, 2); // LCD com endereço I2C 0x27 e 16 colunas x 2 linhas
+
+// Variáveis para controle de tempo de atualização da tela
+unsigned long ultimaAtualizacaoTela = 0;   // Armazena o tempo da última atualização da tela
+const unsigned long intervaloTela = 500;    // Intervalo de atualização da tela em milissegundos
+
+// Variáveis para o alarme
+float maiorMagnitude = 0;             // Armazena a maior magnitude da DFT
+float frequenciaMaiorMagnitude = 0;   // Frequência associada à maior magnitude
+unsigned long tempoUltimaCorrenteAlta = 0; // Armazena o tempo da última corrente alta
+bool alarmeAtivado = false;           // Flag indicando se o alarme foi ativado
+String parametroUltrapassado = "";    // Armazena o parâmetro que ultrapassou o limite
+
+void setup() {
+  pinMode(botaoPin, INPUT_PULLUP);  // Configura o botão como entrada com pull-up interno
+  pinMode(12, OUTPUT);  // Configura o pino 12 como saída (para controle do alarme)
+  digitalWrite(12, LOW); // Inicialmente, desativa o alarme (pino 12 em LOW)
+  
+  lcd.init();          // Inicializa o LCD
+  lcd.backlight();     // Ativa o backlight do LCD
+  lcd.setCursor(0, 0); // Define o cursor na primeira linha do LCD
+  lcd.print("Iniciando...");  // Exibe a mensagem de inicialização no LCD
+
+  // Inicializa os sensores de corrente com os respectivos pinos e multiplicadores
+  sensor1.current(pinSensor1, multiplicador1);
+  sensor2.current(pinSensor2, multiplicador2);
+  sensor3.current(pinSensor3, multiplicador3);
+
+  Serial.begin(115200); // Inicializa a comunicação serial
+
+  delay(1000);  // Aguarda 1 segundo para garantir que todos os dispositivos estejam prontos
+
+  Wire.begin();  // Inicializa o barramento I2C
+  mpu.initialize();  // Inicializa o sensor MPU6050
+
+  // Testa a conexão com o MPU6050
+  if (mpu.testConnection()) {
+    Serial.println("MPU6050 conectado com sucesso!");  // Mensagem de sucesso
+  } else {
+    Serial.println("Falha na conexão com o MPU6050.");  // Mensagem de erro
+    while (1);  // Se falhar, entra em loop infinito
+  }
+  delay(1000);  // Aguarda 1 segundo
+}
+
+void loop() {
+  verificarBotao(); // Verifica o estado do botão para troca de telas ou reset do alarme
+
+  // Calcula as correntes RMS para cada sensor de corrente
+  double I1 = sensor1.calcIrms(1480);
+  double I2 = sensor2.calcIrms(1480);
+  double I3 = sensor3.calcIrms(1480);
+
+  // Lê e calibra as temperaturas dos termopares
+  float T1 = calibraMax6675(thermocouple.readCelsius(), -2.0, 0.99);
+  float T2 = calibraMax6675(thermocouple2.readCelsius(), -2.0, 0.78);
+  float T3 = calibraMax6675(thermocouple3.readCelsius(), -2.0, 1.0);
+  float T4 = calibraMax6675(thermocouple4.readCelsius(), -2.0, 1.05);
+
+  // Coleta amostras de aceleração do sensor MPU6050
+  for (int i = 0; i < SAMPLES; i++) {
+    mpu.getAcceleration(&ax, &ay, &az);  // Lê os valores de aceleração (ax, ay, az)
+    float rawData = float(ax);  // Utiliza o valor de aceleração no eixo X (ax)
+    vReal[i] = applyMovingAverage(rawData); // Aplica a média móvel nos dados de aceleração
+    delayMicroseconds(1000000 / SAMPLING_FREQUENCY); // Delay para manter a frequência de amostragem
+  }
+
+  computeDFT(vReal, amplitudes, SAMPLES);  // Calcula a DFT (Transformada Discreta de Fourier)
+
+  // Determina a maior magnitude e sua frequência associada
+  maiorMagnitude = 0;
+  for (int i = 1; i < SAMPLES / 2; i++) {
+    float freq = (i * SAMPLING_FREQUENCY) / SAMPLES;
+    if (amplitudes[i] > maiorMagnitude) {
+      maiorMagnitude = amplitudes[i];  // Atualiza a maior magnitude
+      frequenciaMaiorMagnitude = freq; // Atualiza a frequência associada
+    }
+  }
+
+  verificarAlarme(I1, I2, I3, T1, T2, T3, T4); // Verifica se algum alarme deve ser ativado
+
+  // Atualiza a tela LCD periodicamente
+  if (millis() - ultimaAtualizacaoTela >= intervaloTela) {
+    ultimaAtualizacaoTela = millis();
+    mostrarTela(telaAtual, T1, T2, T3, T4, I1, I2, I3); // Exibe os dados na tela LCD
+  }
+}
+
+void mostrarTela(int tela, float T1, float T2, float T3, float T4, double I1, double I2, double I3) {
+  lcd.clear();  // Limpa a tela LCD
+
+  // Exibe os dados de temperatura em cada tela
+  switch (tela) {
+    case 0:
+      lcd.setCursor(0, 0);
+      lcd.print("T1:");
+      lcd.print(T1);
+      lcd.print("C");
+      lcd.setCursor(0, 1);
+      lcd.print("T2:");
+      lcd.print(T2);
+      lcd.print("C");
+      lcd.setCursor(8, 0);
+      lcd.print("T3:");
+      lcd.print(T3);
+      lcd.print("C");
+      lcd.setCursor(8, 1);
+      lcd.print("T4:");
+      lcd.print(T4);
+      lcd.print("C");
+      break;
+    case 1:
+      lcd.setCursor(0, 0);
+      lcd.print("Freq: ");
+      lcd.print(frequenciaMaiorMagnitude);
+      lcd.print("Hz");
+      lcd.setCursor(0, 1);
+      lcd.print("Mag: ");
+      lcd.print(maiorMagnitude);
+      break;
+    case 2:
+      lcd.setCursor(0, 0);
+      lcd.print("I1:");
+      lcd.print(I1);
+      lcd.print("A");
+      lcd.setCursor(0, 1);
+      lcd.print("I2:");
+      lcd.print(I2);
+      lcd.print("A");
+      lcd.setCursor(8, 0);
+      lcd.print("I3:");
+      lcd.print(I3);
+      lcd.print("A");
+      break;
+  }
+
+  // Exibe a mensagem de alarme, se ativado
+  if (alarmeAtivado) {
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Alarme ativado:");
+    lcd.setCursor(0, 1);
+    lcd.print(parametroUltrapassado);
+  }
+}
+
+// Função que verifica o estado do botão para alternar as telas ou resetar o alarme
+void verificarBotao() {
+  int leituraBotao = digitalRead(botaoPin); // Lê o estado do botão
+
+  if (leituraBotao == HIGH && ultimoEstadoBotao == LOW && (millis() - ultimaTroca) > debounceDelay) {
+    ultimaTroca = millis();  // Atualiza o tempo da última troca
+
+    if (alarmeAtivado) {
+      alarmeAtivado = false;    // Desativa o alarme
+      parametroUltrapassado = ""; // Limpa o parâmetro ultrapassado
+      digitalWrite(12, LOW);    // Desativa o alarme fisicamente
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("Alarme resetado!"); // Exibe mensagem de reset
+      delay(1000); // Exibe a mensagem por 1 segundo
+    } else {
+      telaAtual++;   // Avança para a próxima tela
+      if (telaAtual > 2) { 
+        telaAtual = 0; // Retorna à primeira tela
+      }
+    }
+  }
+
+  ultimoEstadoBotao = leituraBotao; // Atualiza o estado do botão
+}
+
+// Função para aplicar a média móvel aos dados
+float applyMovingAverage(float newData) {
+  buffer[bufferIndex] = newData;   // Adiciona o novo dado ao buffer
+  bufferIndex = (bufferIndex + 1) % MOVING_AVERAGE_WINDOW; // Atualiza o índice do buffer
+
+  float sum = 0;
+  for (int i = 0; i < MOVING_AVERAGE_WINDOW; i++) {
+    sum += buffer[i];  // Soma todos os valores do buffer
+  }
+
+  return sum / MOVING_AVERAGE_WINDOW; // Retorna a média móvel
+}
+
+// Função para calcular a Transformada Discreta de Fourier (DFT)
+void computeDFT(float* data, float* amplitudes, int length) {
+  for (int k = 0; k < length / 2; k++) {
+    float realSum = 0;
+    float imagSum = 0;
+
+    for (int n = 0; n < length; n++) {
+      float angle = 2 * PI * k * n / length;  // Calcula o ângulo para a DFT
+      realSum += data[n] * cos(angle);   // Soma os termos reais
+      imagSum -= data[n] * sin(angle);   // Soma os termos imaginários
+    }
+
+    amplitudes[k] = sqrt(realSum * realSum + imagSum * imagSum); // Calcula a magnitude
+  }
+}
+
+// Função para calibrar a leitura do termopar MAX6675
+float calibraMax6675(float leituraBruta, float offset, float fator) {
+  return (leituraBruta + offset) * fator; // Aplica o offset e fator de calibração
+}
+
+// Função para verificar se algum parâmetro ultrapassou o limite para ativar o alarme
+void verificarAlarme(double I1, double I2, double I3, float T1, float T2, float T3, float T4) {
+  if (I1 > 0.5 || I2 > 0.5 || I3 > 0.5) {
+    tempoUltimaCorrenteAlta = millis(); // Armazena o tempo da última corrente alta
+  }
+
+  // Se a corrente ou temperatura ultrapassar o limite por mais de 5 segundos, ativa o alarme
+  if (millis() - tempoUltimaCorrenteAlta > 5000) {
+    if (I1 > 6 || I2 > 6 || I3 > 6 || T1 > 150 || T2 > 150 || T3 > 150 || T4 > 150 || maiorMagnitude > 30000) {
+      alarmeAtivado = true; // Ativa o alarme
+
+      // Identifica o parâmetro que ultrapassou o limite
+      if (I1 > 6) parametroUltrapassado = "Corrente I1 > 6A";
+      else if (I2 > 6) parametroUltrapassado = "Corrente I2 > 6A";
+      else if (I3 > 6) parametroUltrapassado = "Corrente I3 > 6A";
+      else if (T1 > 150) parametroUltrapassado = "Temp T1 > 150C";
+      else if (T2 > 150) parametroUltrapassado = "Temp T2 > 150C";
+      else if (T3 > 150) parametroUltrapassado = "Temp T3 > 150C";
+      else if (T4 > 150) parametroUltrapassado = "Temp T4 > 150C";
+      else if (maiorMagnitude > 30000) parametroUltrapassado = "Magnitude > 30000";
+
+      digitalWrite(12, HIGH); // Ativa o alarme (pino 12 em HIGH)
+    }
+  }
+}
